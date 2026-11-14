@@ -1,14 +1,12 @@
 import { createInertiaApp } from '@inertiajs/react'
-import { hydrateRoot } from 'react-dom/client'
+import { echo } from '@inertiajs/react/echo'
+import { configureEcho } from '@laravel/echo-react'
+import Layout from './Components/Layout'
+
+configureEcho({ broadcaster: 'reverb' })
 
 createInertiaApp({
   title: (title) => `${title} - React Playground`,
-  resolve: (name) => {
-    const pages = import.meta.glob('./Pages/**/*.tsx', { eager: true })
-    return pages[`./Pages/${name}.tsx`]
-  },
-  setup({ el, App, props }) {
-    hydrateRoot(el, <App {...props} />)
-    // createRoot(el).render(<App {...props} />)
-  },
+  layout: () => Layout,
+  live: echo(),
 })

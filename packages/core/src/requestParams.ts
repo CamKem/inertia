@@ -1,7 +1,14 @@
-import { AxiosRequestConfig } from 'axios'
 import { page as currentPage } from './page'
 import { Response } from './response'
-import { ActiveVisit, InternalActiveVisit, Page, PreserveStateOption, VisitCallbacks } from './types'
+import {
+  ActiveVisit,
+  HttpRequestHeaders,
+  InternalActiveVisit,
+  Page,
+  PreserveStateOption,
+  VisitCallbacks,
+} from './types'
+import { isSameUrlWithoutHash, isSameUrlWithoutQueryOrHash } from './url'
 
 export class RequestParams {
   protected callbacks: {
@@ -17,12 +24,16 @@ export class RequestParams {
     } else {
       const wrappedCallbacks: Record<keyof VisitCallbacks, () => any> = {
         onBefore: this.wrapCallback(params, 'onBefore'),
+        onBeforeUpdate: this.wrapCallback(params, 'onBeforeUpdate'),
         onStart: this.wrapCallback(params, 'onStart'),
         onProgress: this.wrapCallback(params, 'onProgress'),
         onFinish: this.wrapCallback(params, 'onFinish'),
         onCancel: this.wrapCallback(params, 'onCancel'),
         onSuccess: this.wrapCallback(params, 'onSuccess'),
         onError: this.wrapCallback(params, 'onError'),
+        onHttpException: this.wrapCallback(params, 'onHttpException'),
+        onNetworkError: this.wrapCallback(params, 'onNetworkError'),
+        onFlash: this.wrapCallback(params, 'onFlash'),
         onCancelToken: this.wrapCallback(params, 'onCancelToken'),
         onPrefetched: this.wrapCallback(params, 'onPrefetched'),
         onPrefetching: this.wrapCallback(params, 'onPrefetching'),
@@ -32,9 +43,9 @@ export class RequestParams {
         ...params,
         ...wrappedCallbacks,
         onPrefetchResponse: params.onPrefetchResponse || (() => {}),
+        onPrefetchError: params.onPrefetchError || (() => {}),
       }
     }
-    //
   }
 
   public static create(params: ActiveVisit): RequestParams {
@@ -42,7 +53,7 @@ export class RequestParams {
   }
 
   public data() {
-    return this.params.method === 'get' ? {} : this.params.data
+    return this.params.method === 'get' ? null : this.params.data
   }
 
   public queryParams() {
@@ -51,6 +62,22 @@ export class RequestParams {
 
   public isPartial() {
     return this.params.only.length > 0 || this.params.except.length > 0 || this.params.reset.length > 0
+  }
+
+  public isPrefetch(): boolean {
+    return this.params.prefetch === true
+  }
+
+  public isDeferredPropsRequest() {
+    return this.params.deferredProps === true
+  }
+
+  public isPollRequest() {
+    return this.params.poll === true
+  }
+
+  public isQueryMethodReload() {
+    return this.params.queryMethodReload === true
   }
 
   public onCancelToken(cb: VoidFunction) {
@@ -95,12 +122,18 @@ export class RequestParams {
     }
   }
 
+  public onPrefetchError(error: Error) {
+    if (this.params.onPrefetchError) {
+      this.params.onPrefetchError(error)
+    }
+  }
+
   public all() {
     return this.params
   }
 
-  public headers(): AxiosRequestConfig['headers'] {
-    const headers: AxiosRequestConfig['headers'] = {
+  public headers(): HttpRequestHeaders {
+    const headers: HttpRequestHeaders = {
       ...this.params.headers,
     }
 
@@ -130,8 +163,8 @@ export class RequestParams {
   }
 
   public setPreserveOptions(page: Page) {
-    this.params.preserveScroll = this.resolvePreserveOption(this.params.preserveScroll, page)
-    this.params.preserveState = this.resolvePreserveOption(this.params.preserveState, page)
+    this.params.preserveScroll = RequestParams.resolvePreserveOption(this.params.preserveScroll, page)
+    this.params.preserveState = RequestParams.resolvePreserveOption(this.params.preserveState, page)
   }
 
   public runCallbacks() {
@@ -161,7 +194,7 @@ export class RequestParams {
     this.callbacks.push({ name, args })
   }
 
-  protected resolvePreserveOption(value: PreserveStateOption, page: Page): boolean {
+  public static resolvePreserveOption(value: PreserveStateOption, page: Page): boolean {
     if (typeof value === 'function') {
       return value(page)
     }
@@ -171,5 +204,20 @@ export class RequestParams {
     }
 
     return value
+  }
+
+  /**
+   * Async visits run in the background, so only a sync visit to another URL leaves the page.
+   * Partial visits update the page they're on, so for those only another path counts.
+   * A full QUERY visit may carry a different body to the same URL, so it always leaves the page.
+   */
+  public leavesPage(pageUrl: URL, destinationUrl: URL): boolean {
+    if (this.params.async) {
+      return false
+    }
+
+    return this.isPartial()
+      ? !isSameUrlWithoutQueryOrHash(destinationUrl, pageUrl)
+      : this.params.method === 'query' || !isSameUrlWithoutHash(destinationUrl, pageUrl)
   }
 }

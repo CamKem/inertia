@@ -1,16 +1,11 @@
-import { createInertiaApp, type ResolvedComponent } from '@inertiajs/svelte'
-import { hydrate, mount } from 'svelte'
+import { createInertiaApp } from '@inertiajs/svelte'
+import { echo } from '@inertiajs/svelte/echo'
+import { configureEcho } from '@laravel/echo-svelte'
+import Layout from './Components/Layout.svelte'
+
+configureEcho({ broadcaster: 'reverb' })
 
 createInertiaApp({
-  resolve: (name) => {
-    const pages = import.meta.glob<ResolvedComponent>('./Pages/**/*.svelte', { eager: true })
-    return pages[`./Pages/${name}.svelte`]
-  },
-  setup({ el, App, props }) {
-    if (el.dataset.serverRendered === 'true') {
-      hydrate(App, { target: el, props })
-    } else {
-      mount(App, { target: el, props })
-    }
-  },
+  layout: () => Layout,
+  live: echo(),
 })

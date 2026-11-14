@@ -1,5 +1,6 @@
-import { Poll } from './poll'
+import { Poll, PollCallback } from './poll'
 import { PollOptions } from './types'
+import { visibility } from './visibility'
 
 class Polls {
   protected polls: Poll[] = []
@@ -8,21 +9,34 @@ class Polls {
     this.setupVisibilityListener()
   }
 
+  public get count(): number {
+    return this.polls.length
+  }
+
   public add(
     interval: number,
-    cb: VoidFunction,
+    cb: PollCallback,
     options: PollOptions,
   ): {
     stop: VoidFunction
     start: VoidFunction
+    destroy: VoidFunction
   } {
     const poll = new Poll(interval, cb, options)
+
+    // A tab that was already hidden never fires `visibilitychange`, so the
+    // listener below would leave this poll running at full cadence
+    poll.isInBackground(visibility.isHidden())
 
     this.polls.push(poll)
 
     return {
       stop: () => poll.stop(),
       start: () => poll.start(),
+      destroy: () => {
+        poll.stop()
+        this.polls = this.polls.filter((p) => p !== poll)
+      },
     }
   }
 
@@ -33,17 +47,9 @@ class Polls {
   }
 
   protected setupVisibilityListener() {
-    if (typeof document === 'undefined') {
-      return
-    }
-
-    document.addEventListener(
-      'visibilitychange',
-      () => {
-        this.polls.forEach((poll) => poll.isInBackground(document.hidden))
-      },
-      false,
-    )
+    visibility.onChange((hidden) => {
+      this.polls.forEach((poll) => poll.isInBackground(hidden))
+    })
   }
 }
 

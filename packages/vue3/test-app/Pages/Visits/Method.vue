@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { router } from '@inertiajs/vue3'
 
 const standardVisitMethod = () => {
@@ -30,18 +30,23 @@ const patchMethod = () => {
 const deleteMethod = () => {
   router.delete('/dump/delete')
 }
+
+const queryMethod = () => {
+  router.query('/dump/query')
+}
 </script>
 
 <template>
   <div>
     <span class="text">This is the page that demonstrates manual visit methods</span>
 
-    <a href="#" @click="standardVisitMethod" class="visit-get">Standard visit Link</a>
-    <a href="#" @click="specificVisitMethod" class="visit-specific">Specific visit Link</a>
-    <a href="#" @click="getMethod" class="get">GET Link</a>
-    <a href="#" @click="postMethod" class="post">POST Link</a>
-    <a href="#" @click="putMethod" class="put">PUT Link</a>
-    <a href="#" @click="patchMethod" class="patch">PATCH Link</a>
-    <a href="#" @click="deleteMethod" class="delete">DELETE Link</a>
+    <a href="#" @click.prevent="standardVisitMethod" class="visit-get">Standard visit Link</a>
+    <a href="#" @click.prevent="specificVisitMethod" class="visit-specific">Specific visit Link</a>
+    <a href="#" @click.prevent="getMethod" class="get">GET Link</a>
+    <a href="#" @click.prevent="postMethod" class="post">POST Link</a>
+    <a href="#" @click.prevent="putMethod" class="put">PUT Link</a>
+    <a href="#" @click.prevent="patchMethod" class="patch">PATCH Link</a>
+    <a href="#" @click.prevent="deleteMethod" class="delete">DELETE Link</a>
+    <a href="#" @click.prevent="queryMethod" class="query">QUERY Link</a>
   </div>
 </template>

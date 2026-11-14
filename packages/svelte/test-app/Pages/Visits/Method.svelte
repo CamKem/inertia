@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
   import { router } from '@inertiajs/svelte'
 
   const standardVisitMethod = () => {
@@ -30,16 +30,21 @@
   const deleteMethod = () => {
     router.delete('/dump/delete')
   }
+
+  const queryMethod = () => {
+    router.query('/dump/query')
+  }
 </script>
 
 <div>
   <span class="text">This is the page that demonstrates manual visit methods</span>
 
-  <a href="#" on:click={standardVisitMethod} class="visit-get">Standard visit Link</a>
-  <a href="#" on:click={specificVisitMethod} class="visit-specific">Specific visit Link</a>
-  <a href="#" on:click={getMethod} class="get">GET Link</a>
-  <a href="#" on:click={postMethod} class="post">POST Link</a>
-  <a href="#" on:click={putMethod} class="put">PUT Link</a>
-  <a href="#" on:click={patchMethod} class="patch">PATCH Link</a>
-  <a href="#" on:click={deleteMethod} class="delete">DELETE Link</a>
+  <a href={'#'} onclick={standardVisitMethod} class="visit-get">Standard visit Link</a>
+  <a href={'#'} onclick={specificVisitMethod} class="visit-specific">Specific visit Link</a>
+  <a href={'#'} onclick={getMethod} class="get">GET Link</a>
+  <a href={'#'} onclick={postMethod} class="post">POST Link</a>
+  <a href={'#'} onclick={putMethod} class="put">PUT Link</a>
+  <a href={'#'} onclick={patchMethod} class="patch">PATCH Link</a>
+  <a href={'#'} onclick={deleteMethod} class="delete">DELETE Link</a>
+  <a href={'#'} onclick={queryMethod} class="query">QUERY Link</a>
 </div>

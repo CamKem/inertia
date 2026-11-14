@@ -1,11 +1,12 @@
 import { eventHandler } from './eventHandler'
-import { fireNavigateEvent } from './events'
+import { fireFlashEvent, fireNavigateEvent } from './events'
 import { history } from './history'
 import { navigationType } from './navigationType'
 import { page as currentPage } from './page'
 import { Scroll } from './scroll'
 import { SessionStorage } from './sessionStorage'
 import { LocationVisit, Page } from './types'
+import { uid } from './uid'
 
 export class InitialVisit {
   public static handle(): void {
@@ -19,20 +20,30 @@ export class InitialVisit {
   protected static clearRememberedStateOnReload(): void {
     if (navigationType.isReload()) {
       history.deleteState(history.rememberedState)
+      history.clearInitialState(history.rememberedState)
     }
   }
 
   protected static handleBackForward(): boolean {
-    if (!navigationType.isBackForward() || !history.hasAnyState()) {
+    if (!navigationType.isBackForward() || !history.browserHasHistoryEntry()) {
       return false
     }
+
+    const scrollRegions = history.getScrollRegions()
 
     history
       .decrypt()
       .then((data) => {
-        currentPage.set(data, { preserveScroll: true, preserveState: true }).then(() => {
-          Scroll.restore(currentPage.get())
-          fireNavigateEvent(currentPage.get())
+        if (currentPage.get().version !== data.version) {
+          this.handleDefault()
+          return
+        }
+
+        const visitId = uid()
+
+        currentPage.set(data, { preserveScroll: true, preserveState: true, visitId }).then(() => {
+          Scroll.restore(scrollRegions)
+          fireNavigateEvent(currentPage.get(), { type: 'history', visitId })
         })
       })
       .catch(() => {
@@ -59,24 +70,26 @@ export class InitialVisit {
     }
 
     history
-      .decrypt()
+      .decrypt(currentPage.get())
       .then(() => {
+        const visitId = uid()
         const rememberedState = history.getState<Page['rememberedState']>(history.rememberedState, {})
-        const scrollRegions = history.getState<Page['scrollRegions']>(history.scrollRegions, [])
+        const scrollRegions = history.getScrollRegions()
         currentPage.remember(rememberedState)
-        currentPage.scrollRegions(scrollRegions)
 
         currentPage
           .set(currentPage.get(), {
             preserveScroll: locationVisit.preserveScroll,
             preserveState: true,
+            initialRender: true,
+            visitId,
           })
           .then(() => {
             if (locationVisit.preserveScroll) {
-              Scroll.restore(currentPage.get())
+              Scroll.restore(scrollRegions)
             }
 
-            fireNavigateEvent(currentPage.get())
+            this.fireInitialEvents(visitId)
           })
       })
       .catch(() => {
@@ -91,8 +104,28 @@ export class InitialVisit {
       currentPage.setUrlHash(window.location.hash)
     }
 
-    currentPage.set(currentPage.get(), { preserveState: true }).then(() => {
-      fireNavigateEvent(currentPage.get())
-    })
+    const visitId = uid()
+
+    currentPage
+      .set(currentPage.get(), { preserveScroll: true, preserveState: true, initialRender: true, visitId })
+      .then(() => {
+        if (navigationType.isReload()) {
+          Scroll.restore(history.getScrollRegions())
+        } else {
+          Scroll.scrollToAnchor()
+        }
+
+        this.fireInitialEvents(visitId)
+      })
+  }
+
+  protected static fireInitialEvents(visitId: string): void {
+    const page = currentPage.get()
+
+    fireNavigateEvent(page, { type: 'initial', visitId })
+
+    if (Object.keys(page.flash).length > 0) {
+      queueMicrotask(() => fireFlashEvent(page.flash))
+    }
   }
 }

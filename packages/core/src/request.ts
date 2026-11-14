@@ -1,9 +1,21 @@
-import { default as axios, AxiosProgressEvent, AxiosRequestConfig } from 'axios'
-import { fireExceptionEvent, fireFinishEvent, firePrefetchingEvent, fireProgressEvent, fireStartEvent } from './events'
+import { get } from 'es-toolkit/compat'
+import {
+  fireFinishEvent,
+  fireNetworkErrorEvent,
+  firePrefetchingEvent,
+  fireProgressEvent,
+  fireStartEvent,
+} from './events'
+import { http } from './http'
+import { HttpCancelledError, HttpResponseError } from './httpErrors'
+import { interceptors } from './interceptors'
+import { containsBigInt, stringifyJson } from './json'
 import { page as currentPage } from './page'
+import { trackPropRefresh, untrackPropRefresh } from './propRefreshes'
 import { RequestParams } from './requestParams'
 import { Response } from './response'
-import { ActiveVisit, Page } from './types'
+import type { ActiveVisit, Page } from './types'
+import { HttpProgressEvent, HttpRequestConfig, HttpRequestHeaders } from './types'
 import { urlWithoutHash } from './url'
 
 export class Request {
@@ -11,55 +23,105 @@ export class Request {
   protected cancelToken!: AbortController
   protected requestParams: RequestParams
   protected requestHasFinished = false
+  protected optimisticId: number | null
 
   constructor(
     params: ActiveVisit,
     protected page: Page,
+    { optimisticId = null }: { optimisticId?: number | null } = {},
   ) {
     this.requestParams = RequestParams.create(params)
     this.cancelToken = new AbortController()
+    this.optimisticId = optimisticId
   }
 
-  public static create(params: ActiveVisit, page: Page): Request {
-    return new Request(params, page)
+  public static create(params: ActiveVisit, page: Page, options?: { optimisticId?: number | null }): Request {
+    return new Request(params, page, options)
+  }
+
+  public isPrefetch(): boolean {
+    return this.requestParams.isPrefetch()
+  }
+
+  public getUrl(): URL {
+    return this.requestParams.all().url
+  }
+
+  public isOptimistic(): boolean {
+    return this.optimisticId !== null
+  }
+
+  public isPendingOptimistic(): boolean {
+    return this.isOptimistic() && (!this.response || !this.response.isProcessed())
   }
 
   public async send() {
-    this.requestParams.onCancelToken(() => this.cancel({ cancelled: true }))
+    // Track the refresh first: a caller may cancel from `onCancelToken`, which
+    // runs synchronously, and the untracking that follows would find nothing.
+    trackPropRefresh(this.requestParams.all())
 
-    fireStartEvent(this.requestParams.all())
-    this.requestParams.onStart()
+    this.requestParams.onCancelToken(() => {
+      // Once the response has arrived it's too late to cancel, the page is already being updated
+      if (this.response) {
+        return
+      }
 
-    if (this.requestParams.all().prefetch) {
-      this.requestParams.onPrefetching()
-      firePrefetchingEvent(this.requestParams.all())
+      this.cancel({ cancelled: true })
+    })
+
+    let originallyPrefetch = false
+    let processedConfig: HttpRequestConfig
+
+    try {
+      fireStartEvent(this.requestParams.all())
+      this.requestParams.onStart()
+
+      if (this.requestParams.all().prefetch) {
+        this.requestParams.onPrefetching()
+        firePrefetchingEvent(this.requestParams.all())
+      }
+
+      // We capture this up here because the response
+      // will clear the prefetch flag so it can use it
+      // as a regular response once the prefetch is done
+      originallyPrefetch = this.requestParams.all().prefetch
+
+      const config: HttpRequestConfig = {
+        method: this.requestParams.all().method,
+        url: urlWithoutHash(this.requestParams.all().url).href,
+        data: this.requestParams.data(),
+        signal: this.cancelToken.signal,
+        headers: this.getHeaders(),
+        onUploadProgress: this.onProgress.bind(this),
+      }
+
+      // The HTTP clients would throw on a BigInt, so those bodies are encoded here
+      if (containsBigInt(config.data)) {
+        config.data = stringifyJson(config.data)
+        config.headers = { 'Content-Type': 'application/json', ...config.headers }
+      }
+
+      processedConfig = await interceptors.processRequest(this.requestParams.all(), config)
+    } catch (error) {
+      // The request never got off the ground, so the `finally` below that would
+      // normally untrack it never attaches
+      untrackPropRefresh(this.requestParams.all())
+
+      throw error
     }
 
-    // We capture this up here because the response
-    // will clear the prefetch flag so it can use it
-    // as a regular response once the prefetch is done
-    const originallyPrefetch = this.requestParams.all().prefetch
-
-    return axios({
-      method: this.requestParams.all().method,
-      url: urlWithoutHash(this.requestParams.all().url).href,
-      data: this.requestParams.data(),
-      params: this.requestParams.queryParams(),
-      signal: this.cancelToken.signal,
-      headers: this.getHeaders(),
-      onUploadProgress: this.onProgress.bind(this),
-      // Why text? This allows us to delay JSON.parse until we're ready to use the response,
-      // helps with performance particularly on large responses + history encryption
-      responseType: 'text',
-    })
+    return http
+      .getClient()
+      .request(processedConfig)
       .then((response) => {
-        this.response = Response.create(this.requestParams, response, this.page)
+        this.response = Response.create(this.requestParams, response, this.page, this.optimisticId)
 
         return this.response.handle()
       })
       .catch((error) => {
-        if (error?.response) {
-          this.response = Response.create(this.requestParams, error.response, this.page)
+        // Handle HTTP error responses (4xx/5xx)
+        if (error instanceof HttpResponseError) {
+          this.response = Response.create(this.requestParams, error.response, this.page, this.optimisticId)
 
           return this.response.handle()
         }
@@ -67,11 +129,20 @@ export class Request {
         return Promise.reject(error)
       })
       .catch((error) => {
-        if (axios.isCancel(error)) {
+        // Handle cancelled requests
+        if (error instanceof HttpCancelledError) {
           return
         }
 
-        if (fireExceptionEvent(error)) {
+        if (this.requestParams.all().onNetworkError(error) === false) {
+          return
+        }
+
+        if (fireNetworkErrorEvent(error)) {
+          if (originallyPrefetch) {
+            this.requestParams.onPrefetchError(error)
+          }
+
           return Promise.reject(error)
         }
       })
@@ -101,6 +172,8 @@ export class Request {
 
     this.requestHasFinished = true
 
+    untrackPropRefresh(this.requestParams.all())
+
     fireFinishEvent(this.requestParams.all())
     this.requestParams.onFinish()
   }
@@ -118,24 +191,40 @@ export class Request {
     this.fireFinishEvents()
   }
 
-  protected onProgress(progress: AxiosProgressEvent): void {
+  protected onProgress(progress: HttpProgressEvent): void {
     if (this.requestParams.data() instanceof FormData) {
-      progress.percentage = progress.progress ? Math.round(progress.progress * 100) : 0
       fireProgressEvent(progress)
       this.requestParams.all().onProgress(progress)
     }
   }
 
-  protected getHeaders(): AxiosRequestConfig['headers'] {
-    const headers: AxiosRequestConfig['headers'] = {
+  protected getHeaders(): HttpRequestHeaders {
+    const headers: HttpRequestHeaders = {
       ...this.requestParams.headers(),
       Accept: 'text/html, application/xhtml+xml',
       'X-Requested-With': 'XMLHttpRequest',
       'X-Inertia': true,
     }
 
-    if (currentPage.get().version) {
-      headers['X-Inertia-Version'] = currentPage.get().version
+    const page = currentPage.get()
+
+    if (page.version) {
+      headers['X-Inertia-Version'] = page.version
+    }
+
+    const onceProps = Object.entries(page.onceProps || {})
+      .filter(([, onceProp]) => {
+        if (get(page.props, onceProp.prop) === undefined) {
+          // The prop could deferred and not be loaded yet
+          return false
+        }
+
+        return !onceProp.expiresAt || onceProp.expiresAt > Date.now()
+      })
+      .map(([key]) => key)
+
+    if (onceProps.length > 0) {
+      headers['X-Inertia-Except-Once-Props'] = onceProps.join(',')
     }
 
     return headers

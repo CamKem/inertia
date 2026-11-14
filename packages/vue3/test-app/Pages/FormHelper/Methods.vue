@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { useForm } from '@inertiajs/vue3'
 const form = useForm({
   name: 'foo',
@@ -20,6 +20,21 @@ const patchForm = () => {
 const deleteForm = () => {
   form.delete('/dump/delete')
 }
+
+const queryForm = () => {
+  form.query('/dump/query')
+}
+
+const submitForm = () => {
+  form.submit('post', '/dump/post')
+}
+
+const submitFormObject = () => {
+  form.submit({
+    method: 'post',
+    url: '/dump/post',
+  })
+}
 </script>
 
 <template>
@@ -37,5 +52,8 @@ const deleteForm = () => {
     <button @click="putForm" class="put">PUT form</button>
     <button @click="patchForm" class="patch">PATCH form</button>
     <button @click="deleteForm" class="delete">DELETE form</button>
+    <button @click="queryForm" class="query">QUERY form</button>
+    <button @click="submitForm" class="delete">SUBMIT form</button>
+    <button @click="submitFormObject" class="delete">SUBMIT OBJECT form</button>
   </div>
 </template>

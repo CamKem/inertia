@@ -1,6 +1,8 @@
+import { get } from 'es-toolkit/compat'
 import debounce from './debounce'
 import { fireNavigateEvent } from './events'
 import { history } from './history'
+import { router } from './index'
 import { page as currentPage } from './page'
 import { Scroll } from './scroll'
 import { GlobalEvent, GlobalEventNames, GlobalEventResult, InternalEvent } from './types'
@@ -9,16 +11,21 @@ import { hrefToUrl } from './url'
 class EventHandler {
   protected internalListeners: {
     event: InternalEvent
-    listener: VoidFunction
+    listener: (...args: any[]) => void
   }[] = []
+
+  protected onWindowScroll = debounce(() => Scroll.onWindowScroll(), 100)
+  protected onScroll = debounce((event: Event) => Scroll.onScroll(event), 100)
 
   public init() {
     if (typeof window !== 'undefined') {
       window.addEventListener('popstate', this.handlePopstateEvent.bind(this))
+      window.addEventListener('pageshow', this.handlePageshowEvent.bind(this))
+      window.addEventListener('scroll', this.onWindowScroll, true)
     }
 
     if (typeof document !== 'undefined') {
-      document.addEventListener('scroll', debounce(Scroll.onScroll.bind(Scroll), 100), true)
+      document.addEventListener('scroll', this.onScroll, true)
     }
   }
 
@@ -37,7 +44,7 @@ class EventHandler {
     return this.registerListener(`inertia:${type}`, listener)
   }
 
-  public on(event: InternalEvent, callback: VoidFunction): VoidFunction {
+  public on(event: InternalEvent, callback: (...args: any[]) => void): VoidFunction {
     this.internalListeners.push({ event, listener: callback })
 
     return () => {
@@ -53,8 +60,10 @@ class EventHandler {
     this.fireInternalEvent('missingHistoryItem')
   }
 
-  public fireInternalEvent(event: InternalEvent): void {
-    this.internalListeners.filter((listener) => listener.event === event).forEach((listener) => listener.listener())
+  public fireInternalEvent(event: InternalEvent, ...args: any[]): void {
+    this.internalListeners
+      .filter((listener) => listener.event === event)
+      .forEach((listener) => listener.listener(...args))
   }
 
   protected registerListener(type: string, listener: EventListener): VoidFunction {
@@ -63,36 +72,70 @@ class EventHandler {
     return () => document.removeEventListener(type, listener)
   }
 
+  // bfcache restores pages without firing `popstate`, so we use `pageshow` to
+  // re-validate encrypted history entries after `clearHistory` removed the keys.
+  // https://web.dev/articles/bfcache
+  protected handlePageshowEvent(event: PageTransitionEvent): void {
+    if (event.persisted) {
+      history.decrypt().catch(() => this.onMissingHistoryItem())
+    }
+  }
+
   protected handlePopstateEvent(event: PopStateEvent): void {
+    this.onWindowScroll.cancel()
+    this.onScroll.cancel()
+
     const state = event.state || null
 
     if (state === null) {
       const url = hrefToUrl(currentPage.get().url)
       url.hash = window.location.hash
 
-      history.replaceState({ ...currentPage.get(), url: url.href })
-      Scroll.reset(currentPage.get())
+      history.replaceState({ ...currentPage.getWithoutFlashData(), url: url.href })
+      Scroll.reset()
 
       return
     }
 
-    if (history.isValidState(state)) {
-      history
-        .decrypt(state.page)
-        .then((data) => {
-          currentPage.setQuietly(data, { preserveState: false }).then(() => {
-            Scroll.restore(currentPage.get())
-            fireNavigateEvent(currentPage.get())
-          })
-        })
-        .catch(() => {
+    if (!history.isValidState(state)) {
+      return this.onMissingHistoryItem()
+    }
+
+    // Cancel ongoing requests except prefetch requests before decrypting,
+    // so a response that arrives in the meantime can't replace the restored page
+    router.cancelAll({ prefetch: false })
+
+    history
+      .decrypt(state.page)
+      .then((data) => {
+        if (currentPage.get().version !== data.version) {
           this.onMissingHistoryItem()
+          return
+        }
+
+        currentPage.setQuietly(data, { preserveState: false }).then(() => {
+          Scroll.restore(history.getScrollRegions())
+          fireNavigateEvent(currentPage.get(), { type: 'history' })
+
+          const pendingDeferred: Record<string, string[]> = {}
+          const pageProps = currentPage.get().props
+
+          for (const [group, props] of Object.entries(data.initialDeferredProps ?? data.deferredProps ?? {})) {
+            const missing = props.filter((prop) => get(pageProps, prop) === undefined)
+
+            if (missing.length > 0) {
+              pendingDeferred[group] = missing
+            }
+          }
+
+          if (Object.keys(pendingDeferred).length > 0) {
+            this.fireInternalEvent('loadDeferredProps', pendingDeferred)
+          }
         })
-
-      return
-    }
-
-    this.onMissingHistoryItem()
+      })
+      .catch(() => {
+        this.onMissingHistoryItem()
+      })
   }
 }
 

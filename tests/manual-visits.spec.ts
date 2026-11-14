@@ -1,5 +1,13 @@
 import test, { expect } from '@playwright/test'
-import { clickAndWaitForResponse, consoleMessages, pageLoads, requests, shouldBeDumpPage } from './support'
+import {
+  clickAndWaitForResponse,
+  consoleMessages,
+  pageLoads,
+  requests,
+  scrollElementTo,
+  shouldBeDumpPage,
+  waitForFragmentScroll,
+} from './support'
 
 test('visits a different page', async ({ page }) => {
   pageLoads.watch(page)
@@ -10,13 +18,50 @@ test('visits a different page', async ({ page }) => {
 })
 
 test('can make a location visit', async ({ page }) => {
-  test.skip(process.env.PACKAGE === 'svelte', 'Skipping for now until we diagnose')
-
   pageLoads.watch(page, 2)
   await page.goto('/visits/location')
   await clickAndWaitForResponse(page, 'Location visit', 'dump/get')
   await page.waitForLoadState('networkidle')
   await expect(pageLoads.count).toBe(2)
+
+  const dump = await shouldBeDumpPage(page, 'get')
+
+  await expect(dump.headers).not.toHaveProperty('x-inertia')
+})
+
+test('does not force a hard refresh when an asset version change lands on a background request', async ({ page }) => {
+  pageLoads.watch(page)
+  await page.goto('/visits/async-location-visit')
+
+  await page.fill('#draft', 'unsaved work')
+
+  const response = page.waitForResponse('**/visits/async-location-visit**')
+  await page.getByRole('button', { name: 'Background reload' }).click()
+  await response
+
+  await expect(page.locator('#version-change')).toHaveText('true')
+  await expect(page.locator('#draft')).toHaveValue('unsaved work')
+})
+
+test('lets you handle a background asset version change yourself', async ({ page }) => {
+  pageLoads.watch(page)
+  await page.goto('/visits/async-location-visit')
+
+  await page.fill('#draft', 'unsaved work')
+  await page.getByRole('button', { name: 'Banner mode' }).click()
+
+  const response = page.waitForResponse('**/visits/async-location-visit**')
+  await page.getByRole('button', { name: 'Background reload' }).click()
+  await response
+
+  await expect(page.locator('#banner')).toHaveText('A new version is available')
+  await expect(page.locator('#draft')).toHaveValue('unsaved work')
+})
+
+test('still honors a manual location visit made from a background request', async ({ page }) => {
+  await page.goto('/visits/async-location-visit')
+
+  await page.getByRole('button', { name: 'Background manual location' }).click()
 
   const dump = await shouldBeDumpPage(page, 'get')
 
@@ -38,6 +83,270 @@ test.describe('Auto-cancellation', () => {
     await expect(consoleMessages.messages[0]).toBe('started')
     await expect(consoleMessages.messages[1]).toBe('cancelled')
     await expect(consoleMessages.messages[2]).toBe('started')
+  })
+
+  test('it does not apply an interrupted visit whose component is still resolving', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit')
+    await expect(page.getByText('Signed in as John')).toBeVisible()
+
+    await page.getByRole('link', { name: 'Open the held page' }).click()
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.getByRole('button', { name: 'Post comment' }).click()
+    await page.getByRole('button', { name: 'Release held component' }).click()
+
+    await expect(page.getByText('Status: Comment posted')).toBeVisible()
+    await expect(page.getByText('Signed in as John')).toBeVisible()
+    await expect(page.getByText('This is the held page.')).not.toBeVisible()
+    await expect(page).toHaveURL('/visits/interrupted-visit')
+  })
+
+  test('it still reports success for a visit whose page was applied before a newer visit interrupted it', async ({
+    page,
+  }) => {
+    await page.goto('/visits/interrupted-visit')
+
+    consoleMessages.listen(page)
+
+    // Holding the encryption of the history entry keeps the visit between applying its page and finishing
+    await page.evaluate(() => {
+      const encrypt = window.crypto.subtle.encrypt.bind(window.crypto.subtle)
+
+      window.crypto.subtle.encrypt = (...args) =>
+        new Promise((resolve) => ((window as any).releaseEncryption = resolve)).then(() => encrypt(...args))
+    })
+
+    await page.evaluate(() =>
+      window.testing.Inertia.visit('/visits/interrupted-visit/encrypted', { onSuccess: () => console.log('success') }),
+    )
+    await page.waitForFunction(() => (window as any).releaseEncryption !== undefined)
+
+    await page.evaluate(() => {
+      window.testing.Inertia.visit('/visits/interrupted-visit')
+      ;(window as any).releaseEncryption()
+    })
+
+    await expect(page.getByText('Status: No comments yet')).toBeVisible()
+    await expect(page).toHaveURL('/visits/interrupted-visit')
+    expect(consoleMessages.messages).toContain('success')
+  })
+
+  test('it does not apply an interrupted prefetched visit whose component is still resolving', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit')
+    await page.waitForFunction(() => window.testing.Inertia.getCached('/visits/interrupted-visit/prefetched') !== null)
+
+    await page.getByRole('link', { name: 'Open the prefetched held page' }).click()
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.getByRole('button', { name: 'Post comment' }).click()
+    await page.getByRole('button', { name: 'Release held component' }).click()
+
+    await expect(page.getByText('Status: Comment posted')).toBeVisible()
+    await expect(page.getByText('Signed in as John')).toBeVisible()
+    await expect(page.getByText('This is the held page.')).not.toBeVisible()
+    await expect(page).toHaveURL('/visits/interrupted-visit')
+  })
+
+  test('it does not apply a prefetched visit that is still in flight when the back button is pressed', async ({
+    page,
+  }) => {
+    await page.goto('/visits/interrupted-visit')
+
+    // Gives the back button an entry within the app to return to
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit?again=1'))
+    await page.waitForURL('/visits/interrupted-visit?again=1')
+
+    const slowResponse = page.waitForResponse('**/visits/interrupted-visit/slow')
+    await page.getByRole('link', { name: 'Open the slow prefetched page' }).click()
+    await page.waitForFunction(() => window.testing.Inertia.getPrefetching('/visits/interrupted-visit/slow') !== null)
+
+    await page.goBack()
+    await page.waitForURL('/visits/interrupted-visit')
+    await slowResponse
+
+    // Responses are applied one at a time, so this reload only finishes after the slow response was handled
+    await page.evaluate(() => new Promise((resolve) => window.testing.Inertia.reload({ onFinish: resolve })))
+
+    await expect(page).toHaveURL('/visits/interrupted-visit')
+    await expect(page.getByText('Status: Opened the slow page')).not.toBeVisible()
+  })
+
+  test('it finishes a visit that was waiting for its prefetch when a newer visit interrupts it', async ({ page }) => {
+    let releasePrefetch!: () => void
+    const prefetchHeld = new Promise<void>((resolve) => (releasePrefetch = resolve))
+
+    await page.route('**/visits/interrupted-visit/slow', async (route) => {
+      await prefetchHeld
+      await route.continue()
+    })
+
+    await page.goto('/visits/interrupted-visit')
+
+    consoleMessages.listen(page)
+
+    await page.evaluate(() => window.testing.Inertia.prefetch('/visits/interrupted-visit/slow'))
+    await page.waitForFunction(() => window.testing.Inertia.getPrefetching('/visits/interrupted-visit/slow') !== null)
+
+    await page.evaluate(() => {
+      window.testing.Inertia.visit('/visits/interrupted-visit/slow', {
+        onCancel: () => console.log('cancel'),
+        onFinish: () => console.log('finish'),
+      })
+      window.testing.Inertia.visit('/visits/interrupted-visit')
+    })
+
+    await expect.poll(() => consoleMessages.messages).toEqual(['cancel', 'finish'])
+    await expect(page.getByText('Status: No comments yet')).toBeVisible()
+
+    releasePrefetch()
+  })
+
+  test('it does not report success for a second visit from the prefetch cache that was dropped', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit')
+    await page.waitForFunction(() => window.testing.Inertia.getCached('/visits/interrupted-visit/prefetched') !== null)
+
+    await page.getByRole('link', { name: 'Open the prefetched held page' }).click()
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+    await page.evaluate(() => window.releaseHeldComponent!())
+    await expect(page.getByText('This is the held page.')).toBeVisible()
+
+    await page.goBack()
+    await expect(page.getByText('Status: No comments yet')).toBeVisible()
+
+    consoleMessages.listen(page)
+
+    await page.evaluate(() => {
+      window.releaseHeldComponent = undefined
+      window.testing.Inertia.visit('/visits/interrupted-visit/prefetched', { onSuccess: () => console.log('success') })
+    })
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => {
+      window.testing.Inertia.visit('/visits/interrupted-visit')
+      window.releaseHeldComponent!()
+    })
+
+    await expect(page.getByText('Status: No comments yet')).toBeVisible()
+
+    // Responses are applied one at a time, so this reload only finishes after the dropped visit was handled
+    await page.evaluate(() => new Promise((resolve) => window.testing.Inertia.reload({ onFinish: resolve })))
+
+    await expect(page.getByText('This is the held page.')).not.toBeVisible()
+    expect(consoleMessages.messages).not.toContain('success')
+  })
+
+  test('it only cancels a prefetched async visit when async requests are cancelled', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit')
+    await page.waitForFunction(() => window.testing.Inertia.getCached('/visits/interrupted-visit/prefetched') !== null)
+
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit/prefetched', { async: true }))
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => window.testing.Inertia.cancelAll({ async: false }))
+    await page.getByRole('button', { name: 'Release held component' }).click()
+
+    await expect(page.getByText('This is the held page.')).toBeVisible()
+    await expect(page).toHaveURL('/visits/interrupted-visit/prefetched')
+
+    await page.goto('/visits/interrupted-visit')
+    await page.waitForFunction(() => window.testing.Inertia.getCached('/visits/interrupted-visit/prefetched') !== null)
+
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit/prefetched', { async: true }))
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => window.testing.Inertia.cancelAll({ sync: false }))
+    await page.getByRole('button', { name: 'Release held component' }).click()
+
+    // Responses are applied one at a time, so this reload only finishes after the cancelled visit was handled
+    await page.evaluate(() => new Promise((resolve) => window.testing.Inertia.reload({ onFinish: resolve })))
+
+    await expect(page).toHaveURL('/visits/interrupted-visit')
+    await expect(page.getByText('This is the held page.')).not.toBeVisible()
+  })
+
+  test('it clears the history even when the visit that asked for it is interrupted', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit/encrypted')
+    await expect(page.getByText('Status: Encrypted page')).toBeVisible()
+
+    await page.getByRole('link', { name: 'Open the history clearing page' }).click()
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit'))
+    await page.getByRole('button', { name: 'Release held component' }).click()
+    await expect(page.getByText('Status: No comments yet')).toBeVisible()
+
+    requests.listen(page)
+
+    await page.goBack()
+    await expect(page.getByText('Status: Encrypted page')).toBeVisible()
+    await expect(page).toHaveURL('/visits/interrupted-visit/encrypted')
+
+    expect(
+      requests.requests.filter((request) => request.url().includes('/visits/interrupted-visit/encrypted')),
+    ).toHaveLength(1)
+  })
+
+  test('it does not use a prefetched page once a page that clears the history has arrived', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit/encrypted')
+
+    await page.evaluate(() => window.testing.Inertia.prefetch('/visits/interrupted-visit/home'))
+    await page.waitForFunction(() => window.testing.Inertia.getCached('/visits/interrupted-visit/home') !== null)
+
+    await page.getByRole('link', { name: 'Open the history clearing page' }).click()
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    requests.listen(page)
+
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit/home', { async: true }))
+    await page.getByRole('button', { name: 'Release held component' }).click()
+
+    await expect(page.getByText('This is the Test App Entrypoint page')).toBeVisible()
+
+    expect(
+      requests.requests.filter((request) => request.url().includes('/visits/interrupted-visit/home')),
+    ).toHaveLength(1)
+  })
+
+  test('it does not load the deferred props of a dropped visit on a later page', async ({ page }) => {
+    await page.goto('/visits/interrupted-visit')
+
+    await page.evaluate(() => window.testing.Inertia.visit('/visits/interrupted-visit/deferred'))
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => {
+      const release = window.releaseHeldComponent!
+      window.releaseHeldComponent = undefined
+      window.testing.Inertia.cancelAll()
+      release()
+    })
+
+    requests.listen(page)
+
+    await page.evaluate(() =>
+      window.testing.Inertia.visit('/visits/interrupted-visit/deferred', { component: 'Visits/InterruptedVisitHeld' }),
+    )
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    await page.evaluate(() => {
+      const release = window.releaseHeldComponent!
+      window.releaseHeldComponent = undefined
+      release()
+    })
+    await page.waitForFunction(() => window.releaseHeldComponent !== undefined)
+
+    const deferredRequests = () =>
+      requests.requests.filter((request) => request.headers()['x-inertia-partial-data'] === 'comments')
+
+    expect(deferredRequests()).toHaveLength(0)
+
+    const deferredResponse = page.waitForResponse(
+      (response) => response.request().headers()['x-inertia-partial-data'] === 'comments',
+    )
+    await page.evaluate(() => window.releaseHeldComponent!())
+    await deferredResponse
+
+    await expect(page.getByText('This is the held page.')).toBeVisible()
+    expect(deferredRequests()).toHaveLength(1)
   })
 })
 
@@ -75,6 +384,7 @@ test.describe('Method', () => {
     { method: 'put', label: 'PUT' },
     { method: 'patch', label: 'PATCH' },
     { method: 'delete', label: 'DELETE' },
+    { method: 'query', label: 'QUERY' },
   ] as const
 
   data.forEach(({ method, label }) => {
@@ -101,14 +411,14 @@ test.describe('Data', () => {
     test('passes data as params by default when using the visit method', async ({ page }) => {
       await page.getByRole('link', { name: 'Visit Link' }).click()
 
-      // TODO: Should the url actually be /dump/get?foo=visit
       const dump = await shouldBeDumpPage(page, 'get')
 
+      await expect(page).toHaveURL('/dump/get?foo=visit')
       await expect(dump.method).toBe('get')
       await expect(dump.query).toEqual({ foo: 'visit' })
       await expect(dump.form).toEqual({})
       await expect(dump.files).toEqual({})
-      await expect(dump.headers['content-type']).toBe('application/json')
+      await expect(dump.headers['content-type']).not.toBe('application/json')
     })
 
     test.describe('GET method', () => {
@@ -121,27 +431,26 @@ test.describe('Data', () => {
         await expect(dump.query).toEqual({ bar: 'get' })
         await expect(dump.form).toEqual({})
         await expect(dump.files).toEqual({})
-        await expect(dump.headers['content-type']).toBe('application/json')
+        await expect(dump.headers['content-type']).not.toBe('application/json')
       })
 
       const data = [
-        { label: 'QSAF Brackets', formatter: 'brackets', expected: '?a[]=b&a[]=c' },
-        { label: 'QSAF Indices', formatter: 'indices', expected: '?a[0]=b&a[1]=c' },
-        { label: 'QSAF Default', formatter: 'default', expected: '?a[]=b&a[]=c' },
+        { label: 'QSAF Brackets', formatter: 'brackets', expected: '?a[]=b&a[]=c', expectedObject: { a: ['b', 'c'] } },
+        { label: 'QSAF Indices', formatter: 'indices', expected: '?a[0]=b&a[1]=c', expectedObject: { a: ['b', 'c'] } },
+        { label: 'QSAF Default', formatter: 'default', expected: '?a[]=b&a[]=c', expectedObject: { a: ['b', 'c'] } },
+        { label: 'Delete Query Param', formatter: 'delete param', expected: '', expectedObject: {} },
       ]
 
-      data.forEach(({ label, formatter, expected }) => {
+      data.forEach(({ label, formatter, expected, expectedObject }) => {
         test(`can use the ${formatter} query string array formatter`, async ({ page }) => {
           await page.getByRole('link', { name: label }).click()
 
           const dump = await shouldBeDumpPage(page, 'get')
 
-          // TODO: Should this be in the query string? It's not, but... should it be?
-
-          await expect(dump.query).toEqual({ a: ['b', 'c'] })
+          await expect(dump.query).toEqual(expectedObject)
           await expect(dump.method).toBe('get')
           await expect(dump.form).toEqual({})
-          await expect(dump.headers['content-type']).toBe('application/json')
+          await expect(dump.headers['content-type']).not.toBe('application/json')
         })
       })
     })
@@ -151,6 +460,7 @@ test.describe('Data', () => {
       { method: 'put', label: 'PUT', form: { foo: 'put' } },
       { method: 'patch', label: 'PATCH', form: { bar: 'patch' } },
       { method: 'delete', label: 'DELETE', form: { baz: 'delete' } },
+      { method: 'query', label: 'QUERY', form: { foo: 'query' } },
     ] as const
 
     data.forEach(({ method, label, form }) => {
@@ -314,8 +624,13 @@ test.describe('Replace', () => {
 
   data.forEach(({ method }) => {
     // TODO: Not working...
-    test(`replaces the current history state (${method} method)`, async ({ page }) => {
+    test(`replaces the current history state (${method} method)`, async ({ page, browserName }) => {
+      // Firefox handles goBack() differently after replaceState - skip this browser-specific test
+      test.skip(browserName === 'firefox', 'Firefox handles history.replaceState differently')
+
+      const responsePromise = page.waitForResponse('/dump/get')
       await page.getByRole('link', { name: `[State] Replace ${method}: true` }).click()
+      await responsePromise
       await shouldBeDumpPage(page, 'get')
 
       await page.goBack()
@@ -373,7 +688,7 @@ test.describe('Preserve state', () => {
       await expect(componentKey).not.toBeUndefined()
 
       await page.getByRole('link', { name: label }).click()
-      await expect(page).toHaveURL('/visits/preserve-state-page-two')
+      await expect(page).toHaveURL(`/visits/preserve-state-page-two?foo=${expected}`)
 
       const newComponentKey = await page.evaluate(() => (window as any)._inertia_page_key)
       await expect(newComponentKey).not.toBeUndefined()
@@ -411,7 +726,7 @@ test.describe('Preserve state', () => {
       await expect(componentKey).not.toBeUndefined()
 
       await page.getByRole('link', { name: label }).click()
-      await expect(page).toHaveURL('/visits/preserve-state-page-two')
+      await expect(page).toHaveURL(`/visits/preserve-state-page-two?foo=${expected}`)
 
       const newComponentKey = await page.evaluate(() => (window as any)._inertia_page_key)
       await expect(newComponentKey).not.toBeUndefined()
@@ -429,26 +744,43 @@ test.describe('Preserve scroll', () => {
       await page.goto('/visits/preserve-scroll-false')
       await expect(page.getByText('Foo is now default')).toBeVisible()
 
-      await page.evaluate(() => window.scrollTo(5, 7))
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(10, 15))
-
+      await scrollElementTo(
+        page,
+        page.evaluate(() => window.scrollTo(5, 7)),
+      )
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(10, 15)),
+      )
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
 
-    test('does not reset untracked scroll regions in persistent layouts (visit method)', async ({ page }) => {
+    test('does not reset untracked scroll regions in persistent layouts (visit method)', async ({
+      page,
+      browserName,
+    }) => {
+      test.skip(browserName === 'firefox', 'Firefox on Linux auto-adjusts scroll on content change')
+
       await page.getByRole('link', { exact: true, name: 'Reset Scroll' }).click()
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=bar')
       await expect(page.getByText('Foo is now bar')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
 
-    test('does not reset untracked scroll regions in persistent layouts (GET method)', async ({ page }) => {
+    test('does not reset untracked scroll regions in persistent layouts (GET method)', async ({
+      page,
+      browserName,
+    }) => {
+      test.skip(browserName === 'firefox', 'Firefox on Linux auto-adjusts scroll on content change')
+
       await page.getByRole('link', { exact: true, name: 'Reset Scroll (GET)' }).click()
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=baz')
       await expect(page.getByText('Foo is now baz')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
@@ -460,9 +792,11 @@ test.describe('Preserve scroll', () => {
 
       await page
         .getByRole('link', { exact: true, name: 'Reset Scroll (Callback)' })
-        .click({ position: { x: 20, y: 0 } })
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+        .click({ position: { x: 50, y: 5 } })
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=foo')
       await expect(page.getByText('Foo is now foo')).toBeVisible()
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
 
@@ -479,17 +813,26 @@ test.describe('Preserve scroll', () => {
     test('does not restore untracked scroll regions when pressing the back button (visit method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Reset Scroll' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=bar')
       await expect(page.getByText('Foo is now bar')).toBeVisible()
 
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(0, 0))
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(0, 0)),
+      )
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
+      await page.waitForTimeout(100)
       await page.goBack()
 
       await expect(page).toHaveURL('/visits/preserve-scroll-false')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
@@ -497,17 +840,26 @@ test.describe('Preserve scroll', () => {
     test('does not restore untracked scroll regions when pressing the back button (GET method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Reset Scroll (GET)' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=baz')
       await expect(page.getByText('Foo is now baz')).toBeVisible()
 
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(0, 0))
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(0, 0)),
+      )
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
+      await page.waitForTimeout(100)
       await page.goBack()
 
       await expect(page).toHaveURL('/visits/preserve-scroll-false')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
@@ -517,13 +869,15 @@ test.describe('Preserve scroll', () => {
     }) => {
       consoleMessages.listen(page)
 
-      await page.getByRole('link', { name: 'Preserve Scroll (Callback)' }).click({ position: { x: 0, y: 0 } })
+      await page.getByRole('link', { name: 'Preserve Scroll (Callback)' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-false-page-two?foo=baz')
       await expect(page.getByText('Foo is now baz')).toBeVisible()
 
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(0, 0))
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(0, 0)),
+      )
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
       const message = JSON.parse(consoleMessages.messages[0])
@@ -533,10 +887,13 @@ test.describe('Preserve scroll', () => {
       await expect(message.url).not.toBeUndefined()
       await expect(message.version).not.toBeUndefined()
 
+      await page.waitForTimeout(100)
       await page.goBack()
+      await page.waitForTimeout(100)
 
       await expect(page).toHaveURL('/visits/preserve-scroll-false')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
@@ -548,10 +905,17 @@ test.describe('Preserve scroll', () => {
 
       await expect(page).toHaveURL('non-inertia')
 
+      await page.waitForTimeout(100)
       await page.goBack()
 
       await expect(page).toHaveURL('/visits/preserve-scroll-false')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
@@ -562,38 +926,44 @@ test.describe('Preserve scroll', () => {
       await page.goto('/visits/preserve-scroll')
       await expect(page.getByText('Foo is now default')).toBeVisible()
 
-      await page.evaluate(() => window.scrollTo(5, 7))
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(10, 15))
-
+      await scrollElementTo(
+        page,
+        page.evaluate(() => window.scrollTo(5, 7)),
+      )
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(10, 15)),
+      )
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
 
     test('resets scroll regions to the top when doing a regular visit (visit method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Reset Scroll' }).click()
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=bar')
       await expect(page.getByText('Foo is now bar')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
 
     test('resets scroll regions to the top when doing a regular visit (GET method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Reset Scroll (GET)' }).click()
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=baz')
       await expect(page.getByText('Foo is now baz')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
     })
 
     test('resets scroll regions to the top when returning false from a preserveScroll callback', async ({ page }) => {
       consoleMessages.listen(page)
-      await page
-        .getByRole('link', { exact: true, name: 'Reset Scroll (Callback)' })
-        .click({ position: { x: 20, y: 0 } })
+      await page.getByRole('link', { exact: true, name: 'Reset Scroll (Callback)' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=foo')
       await expect(page.getByText('Foo is now foo')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
@@ -609,8 +979,9 @@ test.describe('Preserve scroll', () => {
     test('preserves scroll regions when using the "preserve-scroll" feature (visit method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Preserve Scroll' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=foo')
       await expect(page.getByText('Foo is now foo')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
@@ -618,8 +989,9 @@ test.describe('Preserve scroll', () => {
     test('preserves scroll regions when using the "preserve-scroll" feature (GET method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Preserve Scroll (GET)' }).click()
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=bar')
       await expect(page.getByText('Foo is now bar')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
@@ -628,10 +1000,11 @@ test.describe('Preserve scroll', () => {
       consoleMessages.listen(page)
       await page
         .getByRole('link', { exact: true, name: 'Preserve Scroll (Callback)' })
-        .click({ position: { x: 0, y: 0 } })
+        .click({ position: { x: 50, y: 5 } })
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=baz')
       await expect(page.getByText('Foo is now baz')).toBeVisible()
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
 
@@ -645,11 +1018,13 @@ test.describe('Preserve scroll', () => {
 
     test('restores all tracked scroll regions when pressing the back button (visit method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Preserve Scroll' }).click()
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=foo')
+      await page.waitForTimeout(100)
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
-
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(0, 0))
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(0, 0)),
+      )
 
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
@@ -657,17 +1032,25 @@ test.describe('Preserve scroll', () => {
 
       await expect(page).toHaveURL('/visits/preserve-scroll')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
 
     test('restores all tracked scroll regions when pressing the back button (GET method)', async ({ page }) => {
       await page.getByRole('link', { exact: true, name: 'Preserve Scroll (GET)' }).click()
+      await expect(page).toHaveURL('/visits/preserve-scroll-page-two?foo=bar')
+      await page.waitForTimeout(100)
 
-      await expect(page).toHaveURL('/visits/preserve-scroll-page-two')
-
-      // @ts-ignore
-      await page.evaluate(() => document.querySelector('#slot').scrollTo(0, 0))
+      await scrollElementTo(
+        page,
+        page.evaluate(() => document.querySelector('#slot')?.scrollTo(0, 0)),
+      )
 
       await expect(page.getByText('Slot scroll position is 0 & 0')).toBeVisible()
 
@@ -675,6 +1058,12 @@ test.describe('Preserve scroll', () => {
 
       await expect(page).toHaveURL('/visits/preserve-scroll')
       await expect(page.getByText('Foo is now default')).toBeVisible()
+
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
+
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
@@ -687,9 +1076,13 @@ test.describe('Preserve scroll', () => {
       await page.goBack()
 
       await expect(page).toHaveURL('/visits/preserve-scroll')
+      await expect(page.getByText('Foo is now default')).toBeVisible()
 
-      await page.waitForTimeout(50)
+      await page.waitForFunction(
+        () => document.documentElement.scrollTop === 7 && document.documentElement.scrollLeft === 5,
+      )
 
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 5 & 7')).toBeVisible()
       await expect(page.getByText('Slot scroll position is 10 & 15')).toBeVisible()
     })
@@ -711,18 +1104,23 @@ test.describe('URL fragment navigation (& automatic scrolling)', () => {
     test(`Scrolls to the fragment element when making a ${label} to a different page`, async ({ page }) => {
       await page.getByRole('link', { name: `Basic ${label}` }).click()
       await expect(page).toHaveURL('/visits/url-fragments#target')
+      await waitForFragmentScroll(page)
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).not.toBeVisible()
     })
 
     test(`Scrolls to the fragment element when making a ${label} to the same page`, async ({ page }) => {
       await page.getByRole('link', { exact: true, name: `Fragment ${label}` }).click()
       await expect(page).toHaveURL('/visits/url-fragments#target')
+      await waitForFragmentScroll(page)
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).not.toBeVisible()
     })
 
     test(`Does not scroll to the fragment element when it does not exist on the page (${label})`, async ({ page }) => {
       await page.getByRole('link', { exact: true, name: `Non-existent fragment ${label}` }).click()
       await expect(page).toHaveURL('/visits/url-fragments#non-existent-fragment')
+      await page.getByRole('button', { exact: true, name: 'Update scroll positions' }).click()
       await expect(page.getByText('Document scroll position is 0 & 0')).toBeVisible()
     })
   })
@@ -743,10 +1141,11 @@ test.describe('Partial Reloads', () => {
     test(`does not have headers specific to partial reloads when the feature is not being used ${label}`, async ({
       page,
     }) => {
+      test.setTimeout(10_000)
       requests.listen(page)
 
       await page.getByRole('link', { name: `Update All (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(requests.requests).toHaveLength(1)
 
@@ -760,7 +1159,7 @@ test.describe('Partial Reloads', () => {
       requests.listen(page)
 
       await page.getByRole('link', { name: `'Only' foo + bar (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(requests.requests).toHaveLength(1)
 
@@ -777,7 +1176,7 @@ test.describe('Partial Reloads', () => {
       requests.listen(page)
 
       await page.getByRole('link', { name: `'Except' foo + bar (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(requests.requests).toHaveLength(1)
 
@@ -792,7 +1191,7 @@ test.describe('Partial Reloads', () => {
 
     test(`it updates all props when the feature is not being used (${label})`, async ({ page }) => {
       await page.getByRole('link', { name: `Update All (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(page.getByText('Foo is now 2')).toBeVisible()
       await expect(page.getByText('Bar is now 3')).toBeVisible()
@@ -802,21 +1201,21 @@ test.describe('Partial Reloads', () => {
     test(`it only updates props that are passed through "only" (${label})`, async ({ page }) => {
       await page.getByRole('link', { name: `'Only' foo + bar (${label})` }).click()
 
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(page.getByText('Foo is now 2')).toBeVisible()
       await expect(page.getByText('Bar is now 3')).toBeVisible()
       await expect(page.getByText('Baz is now 3')).toBeVisible()
 
       await page.getByRole('link', { name: `'Only' baz (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=2')
 
       await expect(page.getByText('Foo is now 2')).toBeVisible()
       await expect(page.getByText('Bar is now 3')).toBeVisible()
       await expect(page.getByText('Baz is now 5')).toBeVisible()
 
       await page.getByRole('link', { name: `Update All (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=2')
 
       await expect(page.getByText('Foo is now 3')).toBeVisible()
       await expect(page.getByText('Bar is now 4')).toBeVisible()
@@ -825,19 +1224,80 @@ test.describe('Partial Reloads', () => {
 
     test(`it only updates props that are not passed through "except" (${label})`, async ({ page }) => {
       await page.getByRole('link', { name: `'Except' foo + bar (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(page.getByText('Foo is now 1')).toBeVisible()
       await expect(page.getByText('Bar is now 2')).toBeVisible()
       await expect(page.getByText('Baz is now 4')).toBeVisible()
 
       await page.getByRole('link', { name: `'Except' baz (${label})` }).click()
-      await expect(page).toHaveURL('/visits/partial-reloads')
+      await expect(page).toHaveURL('/visits/partial-reloads?foo=1')
 
       await expect(page.getByText('Foo is now 2')).toBeVisible()
       await expect(page.getByText('Bar is now 3')).toBeVisible()
       await expect(page.getByText('Baz is now 4')).toBeVisible()
     })
+  })
+})
+
+test('can reload on mount', async ({ page }) => {
+  await page.goto('/visits/reload-on-mount')
+  await expect(page.getByText('Name is mounted!')).toBeVisible()
+})
+
+test.describe('Concurrent Reloads', () => {
+  test('does not cancel the first request when a second reload is fired', async ({ page }) => {
+    await page.goto('/reload/concurrent')
+
+    await expect(page.locator('#foo')).toHaveText('Foo: initial foo')
+    await expect(page.locator('#bar')).toHaveText('Bar: initial bar')
+
+    requests.listen(page)
+
+    await page.getByRole('button', { name: 'Reload both props' }).click()
+
+    await page.waitForResponse(
+      (response) => response.request().headers()['x-inertia-partial-data'] === 'foo' && response.status() === 200,
+    )
+
+    await page.waitForResponse(
+      (response) => response.request().headers()['x-inertia-partial-data'] === 'bar' && response.status() === 200,
+    )
+
+    await expect(page.locator('#foo')).toContainText('foo reloaded at')
+    await expect(page.locator('#bar')).toContainText('bar reloaded at')
+
+    const reloadRequests = requests.requests.filter(
+      (r) => r.headers()['x-inertia-partial-data'] && r.url().includes('/reload/concurrent'),
+    )
+    expect(reloadRequests).toHaveLength(2)
+  })
+
+  test('does not cancel the first request when a second reload with data is fired', async ({ page }) => {
+    await page.goto('/reload/concurrent-with-data')
+
+    await expect(page.locator('#foo')).toHaveText('Foo: initial foo')
+    await expect(page.locator('#bar')).toHaveText('Bar: initial bar')
+
+    requests.listen(page)
+
+    await page.getByRole('button', { name: 'Reload both props with data' }).click()
+
+    await page.waitForResponse(
+      (response) => response.request().headers()['x-inertia-partial-data'] === 'foo' && response.status() === 200,
+    )
+
+    await page.waitForResponse(
+      (response) => response.request().headers()['x-inertia-partial-data'] === 'bar' && response.status() === 200,
+    )
+
+    await expect(page.locator('#foo')).toContainText('foo reloaded (week) at')
+    await expect(page.locator('#bar')).toContainText('bar reloaded (week) at')
+
+    const reloadRequests = requests.requests.filter(
+      (r) => r.headers()['x-inertia-partial-data'] && r.url().includes('/reload/concurrent-with-data'),
+    )
+    expect(reloadRequests).toHaveLength(2)
   })
 })
 
@@ -853,7 +1313,7 @@ test.describe('Error bags', () => {
     const dump = await shouldBeDumpPage(page, 'post')
 
     await expect(dump.method).toBe('post')
-    await expect(dump.headers).not.toContain('x-inertia-error-bag')
+    await expect(dump.headers).not.toHaveProperty('x-inertia-error-bag')
   })
 
   test('uses error bags using the visit method', async ({ page }) => {
@@ -877,6 +1337,33 @@ test.describe('Error bags', () => {
   })
 })
 
+test.describe('Wayfinder object', () => {
+  test.beforeEach(async ({ page }) => {
+    pageLoads.watch(page)
+    await page.goto('/visits/wayfinder')
+  })
+
+  test('can use UrlMethodPair object with visit method', async ({ page }) => {
+    await page.getByRole('link', { name: 'Wayfinder object visit' }).click()
+
+    const dump = await shouldBeDumpPage(page, 'post')
+
+    await expect(dump.method).toBe('post')
+    await expect(dump.query).toEqual({})
+    await expect(dump.form).toEqual({})
+  })
+
+  test('can override UrlMethodPair method with options parameter', async ({ page }) => {
+    await page.getByRole('link', { name: 'Wayfinder object method override' }).click()
+
+    const dump = await shouldBeDumpPage(page, 'patch')
+
+    await expect(dump.method).toBe('patch')
+    await expect(dump.query).toEqual({})
+    await expect(dump.form).toEqual({})
+  })
+})
+
 test.describe('Redirects', () => {
   test('follows 303 redirects', async ({ page }) => {
     pageLoads.watch(page)
@@ -894,4 +1381,111 @@ test.describe('Redirects', () => {
     await expect(page).toHaveURL('/non-inertia')
     await expect(pageLoads.count).toBe(2)
   })
+
+  test('it follows hash redirects via GET without a full page load', async ({ page }) => {
+    pageLoads.watch(page)
+    await page.goto('/')
+
+    await page.getByRole('link', { name: 'Manual Hash Redirect visit' }).click()
+    await expect(page).toHaveURL('/links/url-fragments#target')
+    await expect(page.getByText("This is the element with id 'target'")).toBeVisible()
+    await expect(pageLoads.count).toBe(1)
+  })
+
+  test('it follows hash redirects via POST without a full page load', async ({ page }) => {
+    pageLoads.watch(page)
+    await page.goto('/')
+
+    await page.getByRole('link', { name: 'Manual Hash Redirect POST visit' }).click()
+    await expect(page).toHaveURL('/links/url-fragments#target')
+    await expect(page.getByText("This is the element with id 'target'")).toBeVisible()
+    await expect(pageLoads.count).toBe(1)
+  })
+})
+
+test('can do a subsequent visit after the previous visit has thrown an error in onSuccess', async ({ page }) => {
+  pageLoads.watch(page)
+
+  consoleMessages.listen(page)
+
+  await page.goto('/visits/after-error/1')
+  await expect(page.getByRole('link', { name: 'Throw error on success' })).toBeVisible()
+
+  await expect(consoleMessages.messages).toHaveLength(0)
+  await expect(consoleMessages.errors).toHaveLength(0)
+
+  const response = page.waitForResponse('/visits/after-error/2')
+
+  await page.getByRole('link', { name: 'Throw error on success' }).click()
+  await response
+
+  // Wait for any error to propagate (some browsers may not fire pageerror for framework-caught errors)
+  await page.waitForTimeout(500)
+
+  await expect(consoleMessages.messages).toHaveLength(0)
+
+  // Verify an error was caught if the browser propagated it
+  if (consoleMessages.errors.length > 0) {
+    await expect(consoleMessages.errors[0]).toContain('Error after visit')
+  }
+
+  // The main test: we can still do a subsequent visit after the error
+  await page.getByRole('link', { name: 'Visit dump page' }).click()
+
+  const dump = await shouldBeDumpPage(page, 'get')
+
+  await expect(dump.method).toBe('get')
+  await expect(dump.form).toEqual({})
+})
+
+test('vue proxies synced back to the core adapter are not stored in history state', async ({ page }) => {
+  test.skip(process.env.PACKAGE !== 'vue3', 'Vue 3 specific test')
+  test.setTimeout(10_000)
+
+  pageLoads.watch(page)
+  await page.goto('/visits/proxy')
+  await expect(page.getByText('Site ID: 1')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Update First Site Ref' })).toBeVisible()
+
+  const fooText = await page.locator('#foo').innerText()
+  const statusText = await page.locator('#status-1').innerText()
+  await expect(statusText).toBe('Statuses: running')
+
+  await page.getByRole('button', { name: 'Update First Site Ref' }).click()
+
+  const newStatusText = await page.locator('#status-1').innerText()
+  await expect(newStatusText).not.toBe(statusText)
+  await expect(newStatusText.startsWith('Statuses: frontend-')).toBeTruthy()
+
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await expect(page.locator('#foo')).not.toHaveText(fooText)
+  await expect(await page.locator('#status-1').innerText()).toBe(newStatusText)
+
+  const newFooText = await page.locator('#foo').innerText()
+
+  // Navigate away...
+  await page.getByRole('link', { name: 'Go Home' }).click()
+  await expect(page).toHaveURL('/')
+
+  // Go back...
+  await page.goBack()
+  await expect(page).toHaveURL('/visits/proxy')
+
+  // Ensure state is preserved...
+  await expect(page.locator('#foo')).toHaveText(newFooText)
+  await expect(await page.locator('#status-1').innerText()).toBe(newStatusText)
+
+  // Update ref again...
+  await page.getByRole('button', { name: 'Update First Site Ref' }).click()
+
+  const updatedStatusText = await page.locator('#status-1').innerText()
+  await expect(updatedStatusText).not.toBe(newStatusText)
+  await expect(updatedStatusText.startsWith('Statuses: frontend-')).toBeTruthy()
+
+  // Reload again...
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await expect(page.locator('#foo')).not.toHaveText(newFooText)
+
+  // Ensure updated status is still there
+  await expect(await page.locator('#status-1').innerText()).toBe(updatedStatusText)
 })

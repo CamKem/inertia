@@ -2,11 +2,17 @@ class NavigationType {
   protected type: NavigationTimingType
 
   public constructor() {
-    if (typeof window !== 'undefined' && window?.performance.getEntriesByType('navigation').length > 0) {
-      this.type = (window.performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming).type
-    } else {
-      this.type = 'navigate'
+    this.type = this.resolveType()
+  }
+
+  protected resolveType(): NavigationTimingType {
+    if (typeof window === 'undefined') {
+      return 'navigate'
     }
+
+    const entry = window.performance?.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
+
+    return entry?.type ?? 'navigate'
   }
 
   public get(): NavigationTimingType {
